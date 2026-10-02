@@ -1,0 +1,170 @@
+// Copyright 2025 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package a2a provides a sublauncher that provides A2A capabilities.
+package a2a
+
+import (
+	"flag"
+	"fmt"
+	"net/url"
+
+	a2acore "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2acompat/a2av0"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	"github.com/gorilla/mux"
+
+	"google.golang.org/adk/v2/cmd/launcher"
+	"google.golang.org/adk/v2/cmd/launcher/web"
+	"google.golang.org/adk/v2/internal/cli/util"
+	"google.golang.org/adk/v2/internal/compactionvalidate"
+	"google.golang.org/adk/v2/runner"
+	"google.golang.org/adk/v2/server/adka2a/v2"
+)
+
+// compatAPIPath is a suffix used to build an A2A invocation URL for 0.3
+const compatAPIPath = "/a2a/invoke"
+
+// apiPath is a suffix used to build an A2A invocation URL for 1.0
+const apiPath = "/a2a/v1/invoke"
+
+// a2aConfig contains parameters for launching ADK A2A server
+type a2aConfig struct {
+	agentURL string // user-provided url which will be used in the agent card to specify url for invoking A2A
+}
+
+type a2aLauncher struct {
+	flags  *flag.FlagSet // flags are used to parse command-line arguments
+	config *a2aConfig
+}
+
+// NewLauncher creates new a2a launcher. It extends Web launcher
+func NewLauncher() web.Sublauncher {
+	config := &a2aConfig{}
+
+	fs := flag.NewFlagSet("a2a", flag.ContinueOnError)
+
+	fs.StringVar(&config.agentURL, "a2a_agent_url", "http://localhost:8080", "A2A host URL as advertised in the public agent card. It is used by A2A clients as a connection endpoint.")
+
+	return &a2aLauncher{
+		config: config,
+		flags:  fs,
+	}
+}
+
+// CommandLineSyntax implements web.Sublauncher. Returns the command-line syntax for the A2A launcher.
+func (a *a2aLauncher) CommandLineSyntax() string {
+	return util.FormatFlagUsage(a.flags)
+}
+
+// Keyword implements web.Sublauncher. Returns the command-line keyword for A2A launcher.
+func (a *a2aLauncher) Keyword() string {
+	return "a2a"
+}
+
+func (a *a2aLauncher) Parse(args []string) ([]string, error) {
+	err := a.flags.Parse(args)
+	if err != nil || !a.flags.Parsed() {
+		return nil, fmt.Errorf("failed to parse a2a flags: %v", err)
+	}
+	restArgs := a.flags.Args()
+	return restArgs, nil
+}
+
+// SetupSubrouters implements the web.Sublauncher interface. It adds A2A paths to the main router.
+func (a *a2aLauncher) SetupSubrouters(router *mux.Router, config *launcher.Config) error {
+	// Refuse a compaction config this surface cannot serve, before it serves
+	// anything. A config can pass its own shape check and still be unservable,
+	// the plainest case being no Summarizer over a root agent with no model to
+	// default to, and without this the process starts healthy and then fails
+	// every request. The other surfaces do the same dry run.
+	if err := compactionvalidate.AgainstRootAgent(config.Compaction, config.AgentLoader.RootAgent(), runner.Config{
+		SessionService:  config.SessionService,
+		MemoryService:   config.MemoryService,
+		ArtifactService: config.ArtifactService,
+		PluginConfig:    config.PluginConfig,
+	}); err != nil {
+		return err
+	}
+
+	publicCompatURL, err := url.JoinPath(a.config.agentURL, compatAPIPath)
+	if err != nil {
+		return err
+	}
+	publicURL, err := url.JoinPath(a.config.agentURL, apiPath)
+	if err != nil {
+		return err
+	}
+
+	rootAgent := config.AgentLoader.RootAgent()
+	agentCard := &a2acore.AgentCard{
+		Name:               rootAgent.Name(),
+		Description:        rootAgent.Description(),
+		DefaultInputModes:  []string{"text/plain"},
+		DefaultOutputModes: []string{"text/plain"},
+		SupportedInterfaces: []*a2acore.AgentInterface{
+			{
+				URL:             publicURL,
+				ProtocolBinding: a2acore.TransportProtocolJSONRPC,
+				ProtocolVersion: a2acore.Version,
+			},
+			{
+				URL:             publicCompatURL,
+				ProtocolBinding: a2acore.TransportProtocolJSONRPC,
+				ProtocolVersion: a2av0.Version,
+			},
+		},
+		Version: "2.0.0",
+		Skills:  adka2a.BuildAgentSkills(rootAgent),
+		Capabilities: a2acore.AgentCapabilities{
+			Streaming: true,
+			Extensions: []a2acore.AgentExtension{{
+				URI:         adka2a.ADKExtensionURI,
+				Description: "Content is spread across task artifacts and the status message, which carries long-running function calls.",
+			}},
+		},
+	}
+
+	compatProducer := a2av0.NewStaticAgentCardProducer(agentCard)
+	router.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewAgentCardHandler(compatProducer))
+
+	agent := config.AgentLoader.RootAgent()
+	executor := adka2a.NewExecutor(adka2a.ExecutorConfig{
+		RunnerConfig: runner.Config{
+			AppName:         agent.Name(),
+			Agent:           agent,
+			MemoryService:   config.MemoryService,
+			SessionService:  config.SessionService,
+			ArtifactService: config.ArtifactService,
+			PluginConfig:    config.PluginConfig,
+			Compaction:      config.Compaction,
+		},
+	})
+	reqHandler := a2asrv.NewHandler(executor, config.A2AOptions...)
+
+	router.Handle(apiPath, a2asrv.NewJSONRPCHandler(reqHandler))
+	router.Handle(compatAPIPath, a2av0.NewJSONRPCHandler(reqHandler))
+
+	return nil
+}
+
+// SimpleDescription implements web.Sublauncher
+func (a *a2aLauncher) SimpleDescription() string {
+	return fmt.Sprintf("starts A2A server which handles jsonrpc requests on %s path", apiPath)
+}
+
+// UserMessage implements web.Sublauncher.
+func (a *a2aLauncher) UserMessage(webUrl string, printer func(v ...any)) {
+	printer(fmt.Sprintf("       a2a:  you can access A2A using jsonrpc protocol: %s", webUrl))
+}

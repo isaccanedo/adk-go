@@ -1,0 +1,583 @@
+// Copyright 2025 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package database provides a session.Service backed by a relational
+// database (for example PostgreSQL, Spanner, or SQLite) using GORM.
+//
+// The service never creates or alters its tables. Call [AutoMigrate] after
+// constructing it, on every startup: a release of this package may add
+// columns, and writes to that table fail until they exist. Applications that
+// manage the schema themselves instead of calling AutoMigrate must add those
+// columns before deploying the release that introduces them.
+package database
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+
+	"google.golang.org/adk/v2/platform"
+	"google.golang.org/adk/v2/session"
+)
+
+// databaseService is an database implementation of sessionService.Service.
+type databaseService struct {
+	db *gorm.DB
+}
+
+// NewSessionService creates a new [session.Service] implementation that uses a
+// relational database (e.g., PostgreSQL, Spanner, SQLite) via the GORM library.
+//
+// It requires a [gorm.Dialector] to specify the database connection and
+// accepts optional [gorm.Option] values for further GORM configuration.
+//
+// It returns the new [session.Service] or an error if the database connection
+// [gorm.Open] fails. The service does not create its tables. See [AutoMigrate].
+func NewSessionService(dialector gorm.Dialector, opts ...gorm.Option) (session.Service, error) {
+	db, err := gorm.Open(dialector, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating database session service: %w", err)
+	}
+	return &databaseService{db: db}, nil
+}
+
+// NewSessionServiceFromDB creates a new [session.Service] implementation using
+// an existing [*gorm.DB] connection. This is useful when the application
+// already manages a database connection and wants to share it across multiple
+// services.
+//
+// It returns an error if db is nil. The service does not create its tables.
+// See [AutoMigrate].
+func NewSessionServiceFromDB(db *gorm.DB) (session.Service, error) {
+	if db == nil {
+		return nil, fmt.Errorf("db must not be nil")
+	}
+	return &databaseService{db: db}, nil
+}
+
+// AutoMigrate runs the GORM auto-migration tool to ensure the database schema
+// matches the internal storage models (e.g., storageSession, storageEvent).
+// It creates missing tables and columns, alters existing columns whose type,
+// size or nullability differs from the models, and never drops a column. It
+// can be called repeatedly and is meant to run on every startup.
+//
+// NOTE: This function relies on a type assertion to the concrete *databaseService
+// implementation. It will return an error if the provided session.Service is
+// a different implementation.
+func AutoMigrate(service session.Service) error {
+	dbservice, ok := service.(*databaseService)
+	if !ok {
+		return fmt.Errorf("invalid session service type")
+	}
+	err := dbservice.db.AutoMigrate(&storageSession{}, &storageEvent{}, &storageAppState{}, &storageUserState{})
+	if err != nil {
+		return fmt.Errorf("auto migrate failed: %w", err)
+	}
+	return nil
+}
+
+// Create generates a session and inserts it to the db, implements session.Service
+func (s *databaseService) Create(ctx context.Context, req *session.CreateRequest) (*session.CreateResponse, error) {
+	if req.AppName == "" || req.UserID == "" {
+		return nil, fmt.Errorf("app_name and user_id are required")
+	}
+
+	sessionID := req.SessionID
+	if sessionID == "" {
+		sessionID = platform.NewUUID(ctx)
+	}
+
+	stateMap := req.State
+	if stateMap == nil {
+		stateMap = make(map[string]any)
+	}
+	val := &localSession{
+		appName:   req.AppName,
+		userID:    req.UserID,
+		sessionID: sessionID,
+		state:     stateMap,
+		updatedAt: platform.Now(ctx),
+	}
+	createdSession, err := createStorageSession(ctx, val)
+	if err != nil {
+		return nil, err
+	}
+
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		storageApp, err := fetchStorageAppState(tx, req.AppName)
+		if err != nil {
+			return fmt.Errorf("error on create session: %w", err)
+		}
+		storageUser, err := fetchStorageUserState(tx, req.AppName, req.UserID)
+		if err != nil {
+			return fmt.Errorf("error on create session: %w", err)
+		}
+
+		appDelta, userDelta, sessionState := extractStateDeltas(req.State)
+
+		// apply state delta
+		if len(appDelta) > 0 {
+			maps.Copy(storageApp.State, appDelta)
+			// Maintain UpdateTime explicitly: an unset time.Time serializes to
+			// a zero datetime that MySQL rejects under strict mode.
+			storageApp.UpdateTime = createdSession.UpdateTime
+			if err := tx.Save(&storageApp).Error; err != nil {
+				return fmt.Errorf("failed to save app state: %w", err)
+			}
+		}
+		if len(userDelta) > 0 {
+			maps.Copy(storageUser.State, userDelta)
+			storageUser.UpdateTime = createdSession.UpdateTime
+			if err := tx.Save(&storageUser).Error; err != nil {
+				return fmt.Errorf("failed to save user state: %w", err)
+			}
+		}
+		createdSession.State = sessionState
+
+		if err := tx.Create(createdSession).Error; err != nil {
+			return fmt.Errorf("error creating session on database: %w", err)
+		}
+
+		val.state = mergeStates(storageApp.State, storageUser.State, sessionState)
+		val.updatedAt = createdSession.UpdateTime
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &session.CreateResponse{
+		Session: val,
+	}, nil
+}
+
+// Get retrieves a single session from the database using its composite primary key.
+func (s *databaseService) Get(ctx context.Context, req *session.GetRequest) (*session.GetResponse, error) {
+	// Ensure all parts of the composite key are provided.
+	appName, userID, sessionID := req.AppName, req.UserID, req.SessionID
+	if appName == "" || userID == "" || sessionID == "" {
+		return nil, fmt.Errorf("app_name, user_id, session_id are required, got app_name: %q, user_id: %q, session_id: %q", appName, userID, sessionID)
+	}
+
+	var foundSession storageSession
+	err := s.db.WithContext(ctx).
+		Where(&storageSession{
+			AppName: appName,
+			UserID:  userID,
+			ID:      sessionID,
+		}).
+		First(&foundSession).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("%w: %q: %w", session.ErrNotFound, sessionID, err)
+		}
+		return nil, fmt.Errorf("database error while fetching session: %w", err)
+	}
+
+	// Fetch events
+	eventQuery := s.db.WithContext(ctx).
+		Model(&storageEvent{}).
+		Where("app_name = ?", appName).
+		Where("user_id = ?", userID).
+		Where("session_id = ?", sessionID)
+
+	// Apply conditional filters from the request
+	if !req.After.IsZero() {
+		eventQuery = eventQuery.Where("timestamp >= ?", req.After)
+	}
+
+	// Order by timestamp DESC to get the most recent events when limiting, with
+	// id as a tiebreak so the order is total.
+	//
+	// Without the tiebreak, events sharing a timestamp come back in whatever
+	// order the engine happens to yield and the reversal below then flips them:
+	// SQLite's sort is stable, so a tie is returned in reverse insertion order.
+	// Timestamps are truncated to microseconds on write, so ties are ordinary
+	// rather than exotic. Compaction reads this order to choose what a summary
+	// stands for, and a pair that swaps between two reads means a record can
+	// cover an event nothing summarized, which is that event gone from every
+	// later prompt.
+	//
+	// The id is arbitrary as an ordering, but it is stable, and stable is what
+	// callers need. adk-python orders the same way, by timestamp then id, so
+	// this also removes a divergence rather than creating one.
+	eventQuery = eventQuery.Order("timestamp DESC, id DESC")
+
+	if req.NumRecentEvents > 0 {
+		eventQuery = eventQuery.Limit(req.NumRecentEvents)
+	}
+
+	var storageEvents []storageEvent
+	if err := eventQuery.Find(&storageEvents).Error; err != nil {
+		// This is a system failure, not a "not found"
+		return nil, fmt.Errorf("database error while fetching events: %w", err)
+	}
+
+	// fetch app and user states
+	storageApp, err := fetchStorageAppState(s.db.WithContext(ctx), appName)
+	if err != nil {
+		return nil, fmt.Errorf("error on get session: %w", err)
+	}
+	storageUser, err := fetchStorageUserState(s.db.WithContext(ctx), appName, userID)
+	if err != nil {
+		return nil, fmt.Errorf("error on get session: %w", err)
+	}
+
+	responseSession, err := createSessionFromStorageSession(&foundSession)
+	responseSession.state = mergeStates(storageApp.State, storageUser.State, responseSession.state)
+	if err != nil {
+		return nil, fmt.Errorf("failed to map storage object: %w", err)
+	}
+
+	// We fetched in DESC order to get the most recent ones (due to LIMIT).
+	// Now we reverse them to be in chronological ASC order for the response.
+	// Convert storage events to response events
+	responseEvents := make([]*session.Event, 0, len(storageEvents))
+	for i := len(storageEvents) - 1; i >= 0; i-- {
+		evt, err := createEventFromStorageEvent(&storageEvents[i])
+		if err != nil {
+			return nil, fmt.Errorf("failed to map storage event: %w", err)
+		}
+		responseEvents = append(responseEvents, evt)
+	}
+	responseSession.events = responseEvents
+
+	return &session.GetResponse{
+		Session: responseSession,
+	}, nil
+}
+
+// List retrieves sessions from the database using its appName and optional UserID
+func (s *databaseService) List(ctx context.Context, req *session.ListRequest) (*session.ListResponse, error) {
+	appName, userID := req.AppName, req.UserID
+	if appName == "" {
+		return nil, fmt.Errorf("app_name is required, got app_name: %q", req.AppName)
+	}
+
+	var foundSessions []storageSession
+	listQuery := s.db.WithContext(ctx).
+		Where(&storageSession{
+			AppName: appName,
+		})
+
+	if userID != "" {
+		listQuery = listQuery.Where(&storageSession{
+			UserID: userID,
+		})
+	}
+
+	err := listQuery.Find(&foundSessions).Error
+	if err != nil {
+		// Specifically check if the error is "record not found".
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// This is not a system failure. The record simply doesn't exist.
+			return &session.ListResponse{
+				Sessions: make([]session.Session, 0),
+			}, nil
+		}
+		// For any other error (e.g., connection lost), return it as a system error.
+		return nil, fmt.Errorf("database error while fetching session: %w", err)
+	}
+
+	storageApp, err := fetchStorageAppState(s.db.WithContext(ctx), appName)
+	if err != nil {
+		return nil, fmt.Errorf("error on list sessions: %w", err)
+	}
+
+	var userStates map[string]*storageUserState
+	if userID != "" {
+		userState, err := fetchStorageUserState(s.db.WithContext(ctx), appName, userID)
+		if err != nil {
+			return nil, fmt.Errorf("error on list sessions: %w", err)
+		}
+		userStates = map[string]*storageUserState{userID: userState}
+	} else {
+		userStates, err = fetchAllAppStorageUserState(s.db.WithContext(ctx), appName)
+		if err != nil {
+			return nil, fmt.Errorf("error on list sessions: %w", err)
+		}
+	}
+
+	// Create response sessions, transform the storageSessions into
+	responseSessions := make([]session.Session, 0, len(foundSessions))
+	for _, storage := range foundSessions {
+		s := storage
+		sess, err := createSessionFromStorageSession(&s)
+		if err != nil {
+			// If we encounter a single mapping error, we fail the whole request.
+			return nil, fmt.Errorf("failed to map storage object for session %s: %w", s.ID, err)
+		}
+
+		userState, ok := userStates[sess.UserID()]
+		if !ok {
+			userState = &storageUserState{AppName: appName, UserID: userID, State: make(map[string]any)}
+		}
+		sess.state = mergeStates(storageApp.State, userState.State, sess.state)
+		responseSessions = append(responseSessions, sess)
+	}
+
+	return &session.ListResponse{
+		Sessions: responseSessions,
+	}, nil
+}
+
+// Delete, deletes a session given a specific id returning error on failure, implements session.Service
+func (s *databaseService) Delete(ctx context.Context, req *session.DeleteRequest) error {
+	appName, userID, sessionID := req.AppName, req.UserID, req.SessionID
+	if appName == "" || userID == "" || sessionID == "" {
+		return fmt.Errorf("app_name, user_id, session_id are required, got app_name: %q, user_id: %q, session_id: %q", appName, userID, sessionID)
+	}
+
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		target := &storageSession{}
+
+		result := tx.Where(&storageSession{
+			AppName: req.AppName,
+			UserID:  req.UserID,
+			ID:      req.SessionID,
+		}).Delete(target)
+
+		if result.Error != nil {
+			return fmt.Errorf("database error during session deletion: %w", result.Error)
+		}
+
+		return nil // Returning nil commits the transaction
+	})
+}
+
+func (s *databaseService) AppendEvent(ctx context.Context, curSession session.Session, event *session.Event) error {
+	if curSession == nil {
+		return fmt.Errorf("session is nil")
+	}
+	if event == nil {
+		return fmt.Errorf("event is nil")
+	}
+	// ignore partial events
+	if event.Partial {
+		return nil
+	}
+	// Give the event an identity if it arrived without one, matching the
+	// in-memory service. An event built as a struct literal by an agent or a
+	// tool never passes through session.NewEvent, and anything that identifies
+	// events by ID cannot tell two ID-less events apart.
+	if event.ID == "" {
+		event.ID = platform.NewUUID(ctx)
+	}
+
+	// Truncate timestamp to microsecond precision to match database precision and prevent rounding errors.
+	event.Timestamp = event.Timestamp.Truncate(time.Microsecond)
+
+	sess, ok := curSession.(*localSession)
+	if !ok {
+		return fmt.Errorf("unexpected session type %T", sess)
+	}
+	// append it to session
+	if err := sess.appendEvent(event); err != nil {
+		return err
+	}
+
+	// Trim temp state before persisting
+	event = trimTempDeltaState(event)
+	// applyChanges and persist them
+	err := s.applyEvent(ctx, sess, event)
+	if err != nil {
+		return err
+	}
+
+	// update local session last update time
+	sess.updatedAt = event.Timestamp
+	return nil
+}
+
+// applyEvent fetches the session, validates it, applies state changes from an
+// event, and saves the event atomically.
+func (s *databaseService) applyEvent(ctx context.Context, sess *localSession, event *session.Event) error {
+	// Wrap database operations in a single transaction.
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Fetch the session object from storage.
+		var storageSess storageSession
+		err := tx.Where(&storageSession{AppName: sess.AppName(), UserID: sess.UserID(), ID: sess.ID()}).
+			First(&storageSess).Error
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: %q, cannot apply event: %w", session.ErrNotFound, sess.ID(), err)
+			}
+			return fmt.Errorf("failed to get session: %w", err)
+		}
+
+		// Ensure the session object is not stale.
+		// We use UnixMicro() for microsecond-level precision, matching the Python code.
+		storageUpdateTime := storageSess.UpdateTime.UnixMicro()
+		sessionUpdateTime := sess.updatedAt.UnixMicro()
+		if storageUpdateTime > sessionUpdateTime {
+			return fmt.Errorf(
+				"stale session error: last update time from request (%s) is older than in database (%s)",
+				time.UnixMicro(sessionUpdateTime).Format(time.RFC3339Nano),
+				time.UnixMicro(storageUpdateTime).Format(time.RFC3339Nano),
+			)
+		}
+
+		// Fetch App and User states.
+		storageApp, err := fetchStorageAppState(tx, sess.AppName())
+		if err != nil {
+			return err
+		}
+		storageUser, err := fetchStorageUserState(tx, sess.AppName(), sess.UserID())
+		if err != nil {
+			return err
+		}
+
+		appDelta, userDelta, sessionDelta := extractStateDeltas(event.Actions.StateDelta)
+
+		// Merge state deltas and update the storage objects.
+		// GORM's .Save() method will correctly perform an INSERT or UPDATE.
+		if len(appDelta) > 0 {
+			maps.Copy(storageApp.State, appDelta)
+			// Maintain UpdateTime explicitly (see Create): an unset time.Time
+			// serializes to a zero datetime that MySQL rejects under strict mode.
+			storageApp.UpdateTime = event.Timestamp
+			if err := tx.Save(&storageApp).Error; err != nil {
+				return fmt.Errorf("failed to save app state: %w", err)
+			}
+		}
+		if len(userDelta) > 0 {
+			maps.Copy(storageUser.State, userDelta)
+			storageUser.UpdateTime = event.Timestamp
+			if err := tx.Save(&storageUser).Error; err != nil {
+				return fmt.Errorf("failed to save user state: %w", err)
+			}
+		}
+		if len(sessionDelta) > 0 {
+			maps.Copy(storageSess.State, sessionDelta)
+			// The session state update will be saved along with the event timestamp update.
+		}
+
+		// Create the new event record in the database.
+		storageEv, err := createStorageEvent(sess, event)
+		if err != nil {
+			return fmt.Errorf("failed to map event to storage model: %w", err)
+		}
+		if err := tx.Create(storageEv).Error; err != nil {
+			return fmt.Errorf("failed to save event: %w", err)
+		}
+
+		storageSess.UpdateTime = event.Timestamp
+		// Save the session to update its state and UpdateTime.
+		if err := tx.Save(&storageSess).Error; err != nil {
+			return fmt.Errorf("failed to save session state: %w", err)
+		}
+
+		sess.updatedAt = storageSess.UpdateTime
+
+		return nil // Returning nil commits the transaction.
+	})
+
+	return err
+}
+
+func fetchStorageAppState(tx *gorm.DB, appName string) (*storageAppState, error) {
+	var storageApp storageAppState
+	if err := tx.First(&storageApp, "app_name = ?", appName).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("failed to fetch app state: %w", err)
+		}
+		// If not found, initialize a new object to be created later.
+		storageApp = storageAppState{AppName: appName, State: make(map[string]any)}
+	}
+	return &storageApp, nil
+}
+
+func fetchStorageUserState(tx *gorm.DB, appName, userID string) (*storageUserState, error) {
+	var storageUser storageUserState
+	if err := tx.First(&storageUser, "app_name = ? AND user_id = ?", appName, userID).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("failed to fetch user state: %w", err)
+		}
+		// If not found, initialize a new object.
+		storageUser = storageUserState{AppName: appName, UserID: userID, State: make(map[string]any)}
+	}
+	return &storageUser, nil
+}
+
+func fetchAllAppStorageUserState(tx *gorm.DB, appName string) (map[string]*storageUserState, error) {
+	var storageUserStates []storageUserState
+
+	if err := tx.Find(&storageUserStates, "app_name = ?", appName).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("failed to fetch user states: %w", err)
+		}
+		return make(map[string]*storageUserState), nil
+	}
+	statesByUserId := make(map[string]*storageUserState, len(storageUserStates))
+	for _, storageUserState := range storageUserStates {
+		statesByUserId[storageUserState.UserID] = &storageUserState
+	}
+	return statesByUserId, nil
+}
+
+// extractStateDeltas splits a single state delta map into three separate maps
+// for app, user, and session states based on key prefixes.
+// Temporary keys (starting with session.KeyPrefixTemp) are ignored.
+func extractStateDeltas(delta map[string]any) (
+	appStateDelta, userStateDelta, sessionStateDelta map[string]any,
+) {
+	// Initialize the maps to be returned.
+	appStateDelta = make(map[string]any)
+	userStateDelta = make(map[string]any)
+	sessionStateDelta = make(map[string]any)
+
+	if delta == nil {
+		return appStateDelta, userStateDelta, sessionStateDelta
+	}
+
+	for key, value := range delta {
+		if cleanKey, found := strings.CutPrefix(key, session.KeyPrefixApp); found {
+			appStateDelta[cleanKey] = value
+		} else if cleanKey, found := strings.CutPrefix(key, session.KeyPrefixUser); found {
+			userStateDelta[cleanKey] = value
+		} else if !strings.HasPrefix(key, session.KeyPrefixTemp) {
+			// This key belongs to the session state, as long as it's not temporary.
+			sessionStateDelta[key] = value
+		}
+	}
+	return appStateDelta, userStateDelta, sessionStateDelta
+}
+
+// mergeStates combines app, user, and session state maps into a single map
+// for client-side responses, adding the appropriate prefixes back.
+func mergeStates(appState, userState, sessionState map[string]any) map[string]any {
+	// Pre-allocate map capacity for efficiency.
+	totalSize := len(appState) + len(userState) + len(sessionState)
+	mergedState := make(map[string]any, totalSize)
+
+	// In Go, we create a new map and copy key-value pairs. This is equivalent
+	// to the goal of Python's copy.deepcopy() in this context, which is to
+	// avoid modifying the original sessionState map.
+	maps.Copy(mergedState, sessionState)
+
+	for key, value := range appState {
+		mergedState[session.KeyPrefixApp+key] = value
+	}
+
+	for key, value := range userState {
+		mergedState[session.KeyPrefixUser+key] = value
+	}
+
+	return mergedState
+}

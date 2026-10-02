@@ -1,0 +1,194 @@
+// Copyright 2025 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package context
+
+import (
+	"context"
+
+	"google.golang.org/genai"
+
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/internal/adkcontext"
+	"google.golang.org/adk/v2/platform"
+	"google.golang.org/adk/v2/session"
+)
+
+type InvocationContextParams struct {
+	Artifacts agent.Artifacts
+	Memory    agent.Memory
+	Session   session.Session
+
+	Branch         string
+	IsolationScope string
+	Agent          agent.Agent
+
+	UserContent                 *genai.Content
+	RunConfig                   *agent.RunConfig
+	EndInvocation               bool
+	InvocationID                string
+	LiveSessionResumptionHandle string
+	Path                        string
+	OutputForAncestors          []string
+}
+
+// TODO(kdroste): merge with agent.InvocationContext implementation in agent package, if possible.
+func NewInvocationContext(ctx context.Context, params InvocationContextParams) agent.InvocationContext {
+	if params.InvocationID == "" {
+		params.InvocationID = "e-" + platform.NewUUID(ctx)
+	}
+	return &InvocationContext{
+		Context: ctx,
+		params:  params,
+	}
+}
+
+type InvocationContext struct {
+	context.Context
+	adkcontext.Marker
+
+	params InvocationContextParams
+}
+
+func (c *InvocationContext) Artifacts() agent.Artifacts {
+	return c.params.Artifacts
+}
+
+func (c *InvocationContext) Agent() agent.Agent {
+	return c.params.Agent
+}
+
+func (c *InvocationContext) Branch() string {
+	return c.params.Branch
+}
+
+func (c *InvocationContext) IsolationScope() string {
+	return c.params.IsolationScope
+}
+
+func (c *InvocationContext) InvocationID() string {
+	return c.params.InvocationID
+}
+
+func (c *InvocationContext) Memory() agent.Memory {
+	return c.params.Memory
+}
+
+func (c *InvocationContext) Session() session.Session {
+	return c.params.Session
+}
+
+func (c *InvocationContext) UserContent() *genai.Content {
+	return c.params.UserContent
+}
+
+func (c *InvocationContext) RunConfig() *agent.RunConfig {
+	return c.params.RunConfig
+}
+
+func (c *InvocationContext) EndInvocation() {
+	c.params.EndInvocation = true
+}
+
+func (c *InvocationContext) Ended() bool {
+	return c.params.EndInvocation
+}
+
+// LiveSessionResumptionHandle returns the active live session's resumption handle.
+// This handle is used to reconnect and resume a bidirectional streaming session with the model.
+func (c *InvocationContext) LiveSessionResumptionHandle() string {
+	return c.params.LiveSessionResumptionHandle
+}
+
+// SetLiveSessionResumptionHandle stores the latest resumption handle received from the model.
+// This allows subsequent reconnection attempts in the live loop to resume the same session state.
+func (c *InvocationContext) SetLiveSessionResumptionHandle(handle string) {
+	c.params.LiveSessionResumptionHandle = handle
+}
+
+func (c *InvocationContext) WithContext(ctx context.Context) agent.InvocationContext {
+	newCtx := *c
+	newCtx.Context = ctx
+	return &newCtx
+}
+
+// Value implements context.Context. It returns this invocation's [agent.Identity]
+// for the ADK identity key (so agent.IdentityFromContext can recover it). Every
+// other key delegates to the embedded context, preserving existing behavior.
+//
+// This type owns its session, so the identity key is answered here even when the
+// session cannot be read — with no identity rather than the enclosing
+// invocation's, whose user made no such call and whose credential would
+// otherwise be minted for it.
+//
+// The mapping below duplicates agent.identityOf, which cannot be imported here
+// without a cycle. The two must agree field for field, and nothing about a
+// duplicated literal enforces that on its own: a field added to agent.Identity
+// would be populated there and left zero here. TestIdentityMappingsAgree pins
+// it.
+func (c *InvocationContext) Value(key any) any {
+	if c == nil {
+		return nil
+	}
+	if key == adkcontext.IdentityKey {
+		if id, ok := adkcontext.Recovered(func() agent.Identity {
+			s := c.params.Session
+			return agent.Identity{UserID: s.UserID(), AppName: s.AppName(), SessionID: s.ID()}
+		}); ok {
+			return id
+		}
+		return nil
+	}
+	if c.Context == nil {
+		return nil
+	}
+	return c.Context.Value(key)
+}
+
+// ResumedInput always returns (nil, false) for the base
+// invocation context. Implementations that carry a resume payload
+// override this method.
+func (c *InvocationContext) ResumedInput(string) (any, bool) { return nil, false }
+
+var _ agent.InvocationContext = (*InvocationContext)(nil)
+
+func (c *InvocationContext) WithICDelta(d *agent.InvocationContextDelta) agent.InvocationContext {
+	if d == nil {
+		return c
+	}
+	res := *c
+	if d.UserContent != nil {
+		res.params.UserContent = *d.UserContent
+	}
+	if d.Agent != nil {
+		res.params.Agent = *d.Agent
+	}
+	if d.Context != nil {
+		res.Context = *d.Context
+	}
+	if d.Branch != nil {
+		res.params.Branch = *d.Branch
+	}
+	if d.IsolationScope != nil {
+		res.params.IsolationScope = *d.IsolationScope
+	}
+
+	return &res
+}
+
+// Asserted rather than left to the [adkcontext.Marker] embed: a type whose only
+// other use of the package is that embed loses the import along with it, so the
+// build breaks for an unrelated reason and reads like a guard while guarding
+// nothing. This fails on the type, which is what was meant.
+var _ adkcontext.Source = (*InvocationContext)(nil)

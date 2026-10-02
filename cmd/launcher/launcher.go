@@ -1,0 +1,131 @@
+// Copyright 2025 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package launcher provides ways to interact with agents.
+package launcher
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
+
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/artifact"
+	"google.golang.org/adk/v2/memory"
+	"google.golang.org/adk/v2/runner"
+	"google.golang.org/adk/v2/server/authn"
+	"google.golang.org/adk/v2/server/authz"
+	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/session/compaction"
+	"google.golang.org/adk/v2/telemetry"
+)
+
+// Validate reports a Config that cannot work, before anything starts serving.
+//
+// The compaction config is validated inside runner.New, and a runner is built
+// per request, so without a check here an unusable setting produces a process
+// that starts cleanly and then fails every request with an error naming nothing
+// the operator can act on.
+func (c *Config) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if err := c.Compaction.Validate(); err != nil {
+		return fmt.Errorf("invalid Compaction: %w", err)
+	}
+	return nil
+}
+
+// Launcher is the main interface for running an ADK application.
+// It is responsible for parsing command-line arguments and executing the
+// corresponding logic.
+type Launcher interface {
+	// Execute parses command-line arguments and runs the launcher.
+	Execute(ctx context.Context, config *Config, args []string) error
+	// CommandLineSyntax returns a string describing the command-line flags and arguments.
+	CommandLineSyntax() string
+}
+
+// SubLauncher is an interface for launchers that can be composed within a parent
+// launcher, like the universal launcher. Each SubLauncher corresponds to a
+// specific mode of operation (e.g., 'console' or 'web').
+type SubLauncher interface {
+	// Keyword returns the command-line keyword that activates this sub-launcher.
+	Keyword() string
+	// Parse parses the arguments for the sub-launcher. It should return any unparsed arguments.
+	Parse(args []string) ([]string, error)
+	// CommandLineSyntax returns a string describing the command-line flags and arguments for the sub-launcher.
+	CommandLineSyntax() string
+	// SimpleDescription provides a brief, one-line description of the sub-launcher's function.
+	SimpleDescription() string
+	// Run executes the sub-launcher's main logic.
+	Run(ctx context.Context, config *Config) error
+}
+
+// Config contains parameters for web & console execution: sessions, artifacts, agents etc
+type Config struct {
+	SessionService   session.Service
+	ArtifactService  artifact.Service
+	MemoryService    memory.Service
+	AgentLoader      agent.Loader
+	A2AOptions       []a2asrv.RequestHandlerOption
+	PluginConfig     runner.PluginConfig
+	TelemetryOptions []telemetry.Option
+
+	// Authenticator, when non-nil, authenticates inbound requests to every restapi
+	// endpoint except the public ones (like /health and /version): a request
+	// without valid credentials is answered 401, and an authenticated
+	// request carries the caller's identity on its context. Providers back different schemes (API key,
+	// bearer token, ...); see the [authn] package. Nil, the default, uses [authn.NewNoop]
+	Authenticator authn.Authenticator
+
+	// BindHost is the address the server is bound to, as the web launcher
+	// resolved it from -host. A loopback value arms the Host check in
+	// [adkrest.ServerConfig.BindHost], which refuses a rebound page's
+	// same-origin GET: a browser sends no Origin on one, so Host is the only
+	// thing that gives it away.
+	//
+	// Empty means no bind was declared and that check stays off.
+	BindHost string
+
+	// Authorizer provides a way to check whether the calling user and user from payload match.
+	// You can leave nil if you accept any combination. You will get [authz.Noop] as a default.
+	// You can also use [authz.Strict] which will ensure that the calling user and the
+	// user from the payload are matching exactly
+	Authorizer authz.Authorizer
+
+	// Compaction enables context compaction for the sessions the
+	// runners created here drive, replacing older events with summaries. Nil,
+	// the default, disables compaction.
+	//
+	// The sliding window reduces prompt size by a constant factor rather than
+	// bounding it. Only tail retention bounds growth, and it only fires when
+	// more events accumulate between sliding-window compactions than
+	// EventRetentionSize holds back, so a short interval with a large retention
+	// size leaves it idle. See [compaction.Config].
+	//
+	// This setting is process-wide. One launcher can serve many applications
+	// through its agent loader, and they all get this config or none of them
+	// do, including the same Summarizer instance and so the same model. If
+	// different applications need different compaction, or must not share a
+	// summarizer, run them separately.
+	Compaction *compaction.Config
+	// MaxPayloadSize limits the REST API server's request body size in bytes.
+	// The web launcher sets it from its -max_request_body_size flag, and a
+	// value set by an embedder is honored. The same limit is applied to the
+	// base router and the ADK REST API sublauncher. If <= 0, the adkrest
+	// default (10 MiB) is used.
+	MaxPayloadSize int64
+}

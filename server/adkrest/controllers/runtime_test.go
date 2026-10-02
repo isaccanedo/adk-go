@@ -1,0 +1,351 @@
+// Copyright 2025 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package controllers
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"iter"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"google.golang.org/genai"
+
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/artifact"
+	"google.golang.org/adk/v2/memory"
+	"google.golang.org/adk/v2/plugin"
+	"google.golang.org/adk/v2/runner"
+	"google.golang.org/adk/v2/server/adkrest/internal/fakes"
+	"google.golang.org/adk/v2/server/adkrest/internal/models"
+	"google.golang.org/adk/v2/server/authn"
+	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/session/compaction"
+)
+
+func TestNewRuntimeAPIController_PluginsAssignment(t *testing.T) {
+	p1, err := plugin.New(plugin.Config{Name: "plugin1"})
+	if err != nil {
+		t.Fatalf("plugin.New() failed for plugin1: %v", err)
+	}
+
+	p2, err := plugin.New(plugin.Config{Name: "plugin2"})
+	if err != nil {
+		t.Fatalf("plugin.New() failed for plugin2: %v", err)
+	}
+
+	tc := []struct {
+		name        string
+		plugins     []*plugin.Plugin
+		wantPlugins int
+	}{
+		{
+			name:        "with no plugins",
+			plugins:     nil,
+			wantPlugins: 0,
+		},
+		{
+			name:        "with empty plugin list",
+			plugins:     []*plugin.Plugin{},
+			wantPlugins: 0,
+		},
+		{
+			name:        "with single plugin",
+			plugins:     []*plugin.Plugin{p1},
+			wantPlugins: 1,
+		},
+		{
+			name:        "with multiple plugins",
+			plugins:     []*plugin.Plugin{p1, p2},
+			wantPlugins: 2,
+		},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			controller := NewRuntimeAPIControllerWithConfig(RuntimeAPIControllerConfig{
+				SSETimeout:   10 * time.Second,
+				PluginConfig: runner.PluginConfig{Plugins: tt.plugins},
+			})
+
+			if controller == nil {
+				t.Fatal("NewRuntimeAPIController returned nil")
+			}
+
+			if got := len(controller.pluginConfig.Plugins); got != tt.wantPlugins {
+				t.Errorf("NewRuntimeAPIControllerWithConfig() plugins count = %v, want %v", got, tt.wantPlugins)
+			}
+		})
+	}
+}
+
+type recorderWithDeadline struct {
+	*httptest.ResponseRecorder
+}
+
+func (r *recorderWithDeadline) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
+type testAgentResult struct {
+	event *session.Event
+	err   error
+}
+
+func testAgent(results []testAgentResult) func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+	return func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+		return func(yield func(*session.Event, error) bool) {
+			for _, res := range results {
+				if !yield(res.event, res.err) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func makeEvent(id, author, text string) *session.Event {
+	e := session.NewEvent(context.Background(), id)
+	e.Author = author
+	e.LLMResponse.Content = &genai.Content{
+		Parts: []*genai.Part{{Text: text}},
+	}
+	return e
+}
+
+func TestRunSSEHandler(t *testing.T) {
+	tc := []struct {
+		name       string
+		results    []testAgentResult
+		wantStatus int
+		wantBody   []string
+	}{
+		{
+			name: "success case",
+			results: []testAgentResult{
+				// Non-ASCII text: the stream must carry it through as UTF-8.
+				{event: makeEvent("invocation-1", "testApp", "Hello from agent: 72°F"), err: nil},
+			},
+			wantStatus: http.StatusOK,
+			wantBody:   []string{"data: {", "Hello from agent: 72°F"},
+		},
+		{
+			name: "error case",
+			results: []testAgentResult{
+				{err: fmt.Errorf("agent failed")},
+			},
+			wantStatus: http.StatusOK,
+			wantBody:   []string{"event: error\ndata: {\"error\":\"agent failed\"}\n\n"},
+		},
+		{
+			name: "interleaved success and error",
+			results: []testAgentResult{
+				{event: makeEvent("invocation-1", "testApp", "Hello from agent"), err: nil},
+				{err: fmt.Errorf("agent failed")},
+				{event: makeEvent("invocation-1", "testApp", "More data"), err: nil},
+				{err: fmt.Errorf("agent failed again")},
+			},
+			wantStatus: http.StatusOK,
+			wantBody: []string{
+				"data: {", "Hello from agent",
+				"event: error\ndata: {\"error\":\"agent failed\"}\n\n",
+				"data: {", "More data",
+				"event: error\ndata: {\"error\":\"agent failed again\"}\n\n",
+			},
+		},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			// Setup fake agent with testAgent(tt.results)
+			fakeAgent, err := agent.New(agent.Config{
+				Name: "testApp",
+				Run:  testAgent(tt.results),
+			})
+			if err != nil {
+				t.Fatalf("agent.New failed: %v", err)
+			}
+
+			// Setup fake session service
+			id := fakes.SessionKey{
+				AppName:   "testApp",
+				UserID:    "testUser",
+				SessionID: "testSession",
+			}
+			sessionService := fakes.FakeSessionService{
+				Sessions: map[fakes.SessionKey]fakes.TestSession{
+					id: {
+						Id:            id,
+						SessionState:  fakes.TestState{},
+						SessionEvents: fakes.TestEvents{},
+						UpdatedAt:     time.Now(),
+					},
+				},
+			}
+
+			// Setup controller
+			controller := NewRuntimeAPIControllerWithConfig(RuntimeAPIControllerConfig{
+				SessionService: &sessionService,
+				AgentLoader:    agent.NewSingleLoader(fakeAgent),
+				SSETimeout:     10 * time.Second,
+			})
+
+			// Create request
+			reqObj := models.RunAgentRequest{
+				AppName:   "testApp",
+				UserId:    "testUser",
+				SessionId: "testSession",
+				Streaming: true,
+				NewMessage: genai.Content{
+					Parts: []*genai.Part{{Text: "Hello"}},
+				},
+			}
+			reqBytes, _ := json.Marshal(reqObj)
+			req := httptest.NewRequest(http.MethodPost, "/run-sse", bytes.NewBuffer(reqBytes))
+			req = req.WithContext(authn.WithCaller(t.Context(), &authn.Caller{UserID: reqObj.UserId}))
+
+			// Record response
+			rr := httptest.NewRecorder()
+			w := &recorderWithDeadline{rr}
+
+			// Call handler
+			controller.RunSSEHandler(w, req)
+
+			// Verify response
+			if rr.Code != tt.wantStatus {
+				t.Errorf("expected status %d, got %d", tt.wantStatus, rr.Code)
+			}
+
+			// Without the charset, clients that apply the legacy ISO-8859-1
+			// default for text/* mojibake every non-ASCII rune in the stream.
+			if got, want := rr.Header().Get("Content-Type"), "text/event-stream; charset=UTF-8"; got != want {
+				t.Errorf("Content-Type = %q, want %q", got, want)
+			}
+
+			body := rr.Body.String()
+			for _, s := range tt.wantBody {
+				if !strings.Contains(body, s) {
+					t.Errorf("expected body to contain %q, got %s", s, body)
+				}
+			}
+		})
+	}
+}
+
+func TestDecodeRequestBody_AcceptsFunctionCallEventID(t *testing.T) {
+	body := `{
+		"appName": "a",
+		"userId": "u",
+		"sessionId": "s",
+		"newMessage": {"role": "user", "parts": [{"text": "hi"}]},
+		"functionCallEventId": "fce-1"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewBufferString(body))
+
+	got, err := decodeRequestBody(req)
+	if err != nil {
+		t.Fatalf("decodeRequestBody: unexpected error: %v", err)
+	}
+	if got.FunctionCallEventID == nil || *got.FunctionCallEventID != "fce-1" {
+		t.Errorf("FunctionCallEventID = %v, want %q", got.FunctionCallEventID, "fce-1")
+	}
+}
+
+func TestDecodeRequestBody_RejectsUnknownFields(t *testing.T) {
+	body := `{
+		"appName": "a",
+		"userId": "u",
+		"sessionId": "s",
+		"newMessage": {},
+		"totallyMadeUpField": 123
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewBufferString(body))
+
+	if _, err := decodeRequestBody(req); err == nil {
+		t.Errorf("decodeRequestBody: expected error for unknown field, got nil")
+	}
+}
+
+// TestNewRuntimeAPIController_BackwardCompatible pins that the constructor
+// keeps the signature it was released with, and that the options live on a
+// sibling rather than on a trailing variadic parameter grown onto it.
+//
+// The assertion is the declared type of runtimeCtor below, not anything in the
+// body. A call expression cannot do this job: it keeps compiling when the
+// function it calls gains a trailing variadic, which is exactly the change that
+// breaks a caller using the identifier as a value.
+func TestNewRuntimeAPIController_BackwardCompatible(t *testing.T) {
+	c := runtimeCtor(nil, nil, nil, nil, 10*time.Second, runner.PluginConfig{}, false)
+	if c == nil {
+		t.Fatal("NewRuntimeAPIController() returned nil")
+	}
+	if c.eventsCompactionConfig != nil {
+		t.Errorf("eventsCompactionConfig = %v, want nil when no option is supplied", c.eventsCompactionConfig)
+	}
+}
+
+// runtimeCtor fails to compile if [NewRuntimeAPIController] changes shape.
+var runtimeCtor NewRuntimeAPIControllerFunc = NewRuntimeAPIController
+
+// NewRuntimeAPIControllerFunc is the released signature of
+// [NewRuntimeAPIController].
+type NewRuntimeAPIControllerFunc = func(session.Service, memory.Service, agent.Loader, artifact.Service, time.Duration, runner.PluginConfig, bool) *RuntimeAPIController
+
+func TestNewRuntimeAPIControllerCarriesCompaction(t *testing.T) {
+	cfg := &compaction.Config{CompactionInterval: 2}
+	c := NewRuntimeAPIControllerWithConfig(RuntimeAPIControllerConfig{
+		SSETimeout: 10 * time.Second,
+		Compaction: cfg,
+	})
+	if c.eventsCompactionConfig != cfg {
+		t.Errorf("eventsCompactionConfig = %v, want the config passed in", c.eventsCompactionConfig)
+	}
+}
+
+// TestRunLiveHandlerUsesConfiguredCheckOrigin pins that the configured hook
+// replaces gorilla/websocket's default same-origin check, which would reject an
+// Origin the operator allowed.
+func TestRunLiveHandlerUsesConfiguredCheckOrigin(t *testing.T) {
+	var got *http.Request
+	controller := NewRuntimeAPIControllerWithConfig(RuntimeAPIControllerConfig{
+		SessionService: session.InMemoryService(),
+		AgentLoader:    agent.NewSingleLoader(nil),
+		CheckOrigin: func(r *http.Request) bool {
+			got = r
+			return false
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/run_live?appName=a&userId=u&sessionId=s", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-Websocket-Version", "13")
+	req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	req.Header.Set("Origin", "http://localhost:4200")
+	rr := httptest.NewRecorder()
+	NewErrorHandler(controller.RunLiveHandler)(rr, req)
+
+	if got == nil {
+		t.Fatal("CheckOrigin was not called, want the upgrader to use it")
+	}
+	if want := http.StatusForbidden; rr.Code != want {
+		t.Errorf("status = %d, want %d (body %q)", rr.Code, want, rr.Body.String())
+	}
+}

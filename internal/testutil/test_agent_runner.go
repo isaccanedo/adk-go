@@ -1,0 +1,345 @@
+// Copyright 2025 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package testutil
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"iter"
+	"testing"
+	"time"
+
+	"google.golang.org/genai"
+
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/internal/llminternal"
+	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/runner"
+	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/session/compaction"
+)
+
+type TestAgentRunner struct {
+	agent            agent.Agent
+	sessionService   session.Service
+	lastSession      session.Session
+	initSessionState map[string]any
+	appName          string
+	// TODO: move runner definition to the adk package and it's a part of public api, but the logic to the internal runner
+	runner *runner.Runner
+}
+
+func (r *TestAgentRunner) session(t *testing.T, appName, userID, sessionID string) (session.Session, error) {
+	ctx := t.Context()
+	if last := r.lastSession; last != nil && last.ID() == sessionID {
+		resp, err := r.sessionService.Get(ctx, &session.GetRequest{
+			AppName:   "test_app",
+			UserID:    "test_user",
+			SessionID: sessionID,
+		})
+		r.lastSession = resp.Session
+		return resp.Session, err
+	}
+	resp, err := r.sessionService.Create(ctx, &session.CreateRequest{
+		AppName:   "test_app",
+		UserID:    "test_user",
+		SessionID: sessionID,
+		State:     r.initSessionState,
+	})
+	r.lastSession = resp.Session
+	return resp.Session, err
+}
+
+// SessionService exposes the runner's session service so tests can inspect
+// stored events, including ones the runner appends without yielding, such as
+// context-compaction summaries.
+func (r *TestAgentRunner) SessionService() session.Service {
+	return r.sessionService
+}
+
+func (r *TestAgentRunner) SetInitSessionState(state map[string]any) {
+	r.initSessionState = state
+}
+
+func (r *TestAgentRunner) Run(t *testing.T, sessionID, newMessage string) iter.Seq2[*session.Event, error] {
+	t.Helper()
+
+	var content *genai.Content
+	if newMessage != "" {
+		content = genai.NewContentFromText(newMessage, genai.RoleUser)
+	}
+	return r.RunContent(t, sessionID, content)
+}
+
+func (r *TestAgentRunner) RunContent(t *testing.T, sessionID string, content *genai.Content) iter.Seq2[*session.Event, error] {
+	t.Helper()
+	return r.RunContentWithConfig(t, sessionID, content, agent.RunConfig{})
+}
+
+func (r *TestAgentRunner) RunContentWithConfig(t *testing.T, sessionID string, content *genai.Content, cfg agent.RunConfig) iter.Seq2[*session.Event, error] {
+	t.Helper()
+	ctx := t.Context()
+
+	userID := "test_user"
+
+	session, err := r.session(t, r.appName, userID, sessionID)
+	if err != nil {
+		t.Fatalf("failed to get/create session: %v", err)
+	}
+
+	return r.runner.Run(ctx, userID, session.ID(), content, cfg)
+}
+
+// NewTestAgentRunner creates a new TestAgentRunner for the given agent as root
+// initSessionState will be used to init all sessions created by this runner.
+func NewTestAgentRunner(t *testing.T, agent agent.Agent) *TestAgentRunner {
+	appName := "test_app"
+	sessionService := session.InMemoryService()
+
+	runner, err := runner.New(runner.Config{
+		AppName:        appName,
+		Agent:          agent,
+		SessionService: sessionService,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return &TestAgentRunner{
+		agent:          agent,
+		sessionService: sessionService,
+		appName:        appName,
+		runner:         runner,
+	}
+}
+
+// NewTestAgentRunner creates a new TestAgentRunner for the given agent as root
+// initSessionState will be used to init all sessions created by this runner.
+func NewTestAgentRunnerWithPluginManager(t *testing.T, agent agent.Agent, pluginConfig runner.PluginConfig) *TestAgentRunner {
+	appName := "test_app"
+	sessionService := session.InMemoryService()
+
+	runner, err := runner.New(runner.Config{
+		AppName:        appName,
+		Agent:          agent,
+		SessionService: sessionService,
+		PluginConfig:   pluginConfig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return &TestAgentRunner{
+		agent:          agent,
+		sessionService: sessionService,
+		appName:        appName,
+		runner:         runner,
+	}
+}
+
+// NewTestAgentRunnerWithCompaction creates a TestAgentRunner whose runner has
+// context compaction enabled. Useful for end-to-end tests that need summaries to
+// be produced and substituted into later prompts.
+func NewTestAgentRunnerWithCompaction(t *testing.T, agent agent.Agent, compactionConfig *compaction.Config) *TestAgentRunner {
+	appName := "test_app"
+	sessionService := session.InMemoryService()
+
+	runner, err := runner.New(runner.Config{
+		AppName:        appName,
+		Agent:          agent,
+		SessionService: sessionService,
+		Compaction:     compactionConfig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return &TestAgentRunner{
+		agent:          agent,
+		sessionService: sessionService,
+		appName:        appName,
+		runner:         runner,
+	}
+}
+
+type MockModel struct {
+	Requests             []*model.LLMRequest
+	Responses            []*genai.Content
+	StreamResponsesCount int
+}
+
+var errNoModelData = errors.New("no data")
+
+func (m *MockModel) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
+	if stream {
+		return m.GenerateStream(ctx, req)
+	}
+	return func(yield func(*model.LLMResponse, error) bool) {
+		resp, err := m.Generate(ctx, req)
+		yield(resp, err)
+	}
+}
+
+// GenerateContent implements llm.Model.
+func (m *MockModel) Generate(ctx context.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
+	m.Requests = append(m.Requests, req)
+	if len(m.Responses) == 0 {
+		return nil, errNoModelData
+	}
+
+	resp := &model.LLMResponse{
+		Content: m.Responses[0],
+	}
+
+	m.Responses = m.Responses[1:]
+
+	return resp, nil
+}
+
+func (m *MockModel) GenerateStream(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
+	aggregator := llminternal.NewStreamingResponseAggregator()
+	return func(yield func(*model.LLMResponse, error) bool) {
+		streamResponsesCount := m.StreamResponsesCount
+		if streamResponsesCount == 0 {
+			streamResponsesCount = 1
+		}
+		for i := 0; i < streamResponsesCount; i++ {
+			if len(m.Responses) == 0 {
+				break
+			}
+			resp := &genai.GenerateContentResponse{Candidates: []*genai.Candidate{{Content: m.Responses[0], FinishReason: genai.FinishReasonStop}}}
+			m.Responses = m.Responses[1:]
+			for llmResponse, err := range aggregator.ProcessResponse(ctx, resp) {
+				if !yield(llmResponse, err) {
+					return // Consumer stopped
+				}
+			}
+		}
+		if closeResult := aggregator.Close(); closeResult != nil {
+			yield(closeResult, nil)
+		}
+	}
+}
+
+// Name implements llm.Model.
+func (m *MockModel) Name() string {
+	return "mock"
+}
+
+var _ model.LLM = (*MockModel)(nil)
+
+// CollectEvents collects all event from the llm response until encountering an error.
+// It returns all collected events and the last error.
+func CollectEvents(stream iter.Seq2[*session.Event, error]) ([]*session.Event, error) {
+	var events []*session.Event
+	for ev, err := range stream {
+		if err != nil {
+			return events, err
+		}
+		if ev == nil || ev.LLMResponse.Content == nil {
+			return events, fmt.Errorf("unexpected empty event: %v", ev)
+		}
+		events = append(events, ev)
+	}
+	return events, nil
+}
+
+// CollectParts collects all parts from the llm response until encountering an error.
+// It returns all collected parts and the last error.
+func CollectParts(stream iter.Seq2[*session.Event, error]) ([]*genai.Part, error) {
+	var parts []*genai.Part
+	for ev, err := range stream {
+		if err != nil {
+			return parts, err
+		}
+		if ev == nil || ev.LLMResponse.Content == nil {
+			return parts, fmt.Errorf("unexpected empty event: %v", ev)
+		}
+		parts = append(parts, ev.LLMResponse.Content.Parts...)
+	}
+	return parts, nil
+}
+
+// CollectTextParts collects all text parts from the llm response until encountering an error.
+// It returns all collected text parts and the last error.
+func CollectTextParts(stream iter.Seq2[*session.Event, error]) ([]string, error) {
+	var texts []string
+	for ev, err := range stream {
+		if err != nil {
+			return texts, err
+		}
+		if ev == nil || ev.LLMResponse.Content == nil {
+			return texts, fmt.Errorf("unexpected empty event: %v", ev)
+		}
+		for _, p := range ev.LLMResponse.Content.Parts {
+			if p.Text != "" {
+				texts = append(texts, p.Text)
+			}
+		}
+	}
+	return texts, nil
+}
+
+// awaitDeadline bounds a single Await call. It is generous so that a loaded CI
+// machine does not fail a test that is merely slow. Note that AwaitN arms one
+// timer for all n receives, so this is the budget for the whole call rather
+// than for each value.
+const awaitDeadline = 30 * time.Second
+
+// AwaitN receives n values from ch, or fails the test via t.Fatalf if they do
+// not all arrive within a generous, contention-tolerant deadline. A closed
+// channel counts as a receive, so AwaitN also joins a goroutine that closed ch
+// without sending.
+func AwaitN[T any](t *testing.T, ch <-chan T, n int, what string) {
+	t.Helper()
+	timer := time.NewTimer(awaitDeadline)
+	defer timer.Stop()
+	for i := range n {
+		select {
+		case <-ch:
+		case <-timer.C:
+			t.Fatalf("%s: got %d of %d within %v", what, i, n, awaitDeadline)
+		}
+	}
+}
+
+// AwaitValue receives one value from ch and returns it, failing the test via
+// t.Fatalf if none arrives within the same deadline AwaitN uses.
+//
+// Unlike AwaitN, a closed channel is a failure rather than a receive. Callers
+// use the value, and a producer that closed ch without sending yields only the
+// zero value, which for a channel of interface type is nil and panics on the
+// first method call. Reporting which value never arrived is more useful than
+// that panic, especially when the producer has already recorded the underlying
+// error with t.Errorf: the panic would bury it.
+func AwaitValue[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	timer := time.NewTimer(awaitDeadline)
+	defer timer.Stop()
+	select {
+	case v, ok := <-ch:
+		if !ok {
+			var zero T
+			t.Fatalf("%s: channel closed before a value arrived", what)
+			return zero
+		}
+		return v
+	case <-timer.C:
+		var zero T
+		t.Fatalf("%s: no value within %v", what, awaitDeadline)
+		return zero
+	}
+}

@@ -1,0 +1,507 @@
+// Copyright 2025 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package agent provides entities to build agents using ADK.
+package agent
+
+import (
+	"context"
+	"fmt"
+	"iter"
+
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/genai"
+
+	"google.golang.org/adk/v2/artifact"
+	"google.golang.org/adk/v2/internal/adkcontext"
+	agentinternal "google.golang.org/adk/v2/internal/agent"
+	"google.golang.org/adk/v2/internal/plugininternal/plugincontext"
+	"google.golang.org/adk/v2/internal/telemetry"
+	"google.golang.org/adk/v2/memory"
+	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/session"
+)
+
+// Agent is the base interface which all agents must implement.
+//
+// Agents are created with ADK constructors to ensure correct
+// init & configuration.
+// The constructors are available in this package and its subpackages.
+// For example: llmagent.New, workflow agents, remote agent or
+// agent.New.
+// NOTE: in future releases we will allow just implementing this interface.
+// For now agent.New is a correct solution to create custom agents.
+type Agent interface {
+	Name() string
+	Description() string
+	Run(InvocationContext) iter.Seq2[*session.Event, error]
+	SubAgents() []Agent
+	FindAgent(name string) Agent
+	FindSubAgent(name string) Agent
+
+	internal() *agent
+}
+
+// New creates an Agent with a custom logic defined by Run function.
+func New(cfg Config) (Agent, error) {
+	subAgentSet := make(map[Agent]bool)
+	for _, subAgent := range cfg.SubAgents {
+		if _, ok := subAgentSet[subAgent]; ok {
+			return nil, fmt.Errorf("error creating agent: subagent %q appears multiple times in subAgents", subAgent.Name())
+		}
+		subAgentSet[subAgent] = true
+	}
+	return &agent{
+		name:                 cfg.Name,
+		description:          cfg.Description,
+		subAgents:            cfg.SubAgents,
+		beforeAgentCallbacks: cfg.BeforeAgentCallbacks,
+		run:                  cfg.Run,
+		afterAgentCallbacks:  cfg.AfterAgentCallbacks,
+		State: agentinternal.State{
+			AgentType: agentinternal.TypeCustomAgent,
+		},
+	}, nil
+}
+
+// Config is the configuration for creating a new Agent.
+type Config struct {
+	// Name must be a non-empty string, unique within the agent tree.
+	// Agent name cannot be "user", since it's reserved for end-user's input.
+	Name string
+	// Description of the agent's capability.
+	//
+	// LLM uses this to determine whether to delegate control to the agent.
+	// One-line description is enough and preferred.
+	Description string
+	// SubAgents are the child agents that this agent can delegate tasks to.
+	// ADK will automatically set a parent of each sub-agent to this agent to
+	// allow agent transferring across the tree.
+	SubAgents []Agent
+
+	// BeforeAgentCallbacks is a list of callbacks that are called sequentially
+	// before the agent starts its run.
+	//
+	// If any callback returns non-nil content or error, then the agent run and
+	// the remaining callbacks will be skipped, and a new event will be created
+	// from the content or error of that callback.
+	BeforeAgentCallbacks []BeforeAgentCallback
+	// Run is the function that defines the agent's behavior.
+	Run func(InvocationContext) iter.Seq2[*session.Event, error]
+	// AfterAgentCallbacks is a list of callbacks that are called sequentially
+	// after the agent has completed its run.
+	//
+	// If any callback returns non-nil content or error, then a new event will be
+	// created from the content or error of that callback and the remaining
+	// callbacks will be skipped.
+	AfterAgentCallbacks []AfterAgentCallback
+}
+
+// Artifacts interface provides methods to work with artifacts of the current
+// session.
+type Artifacts interface {
+	Save(ctx context.Context, name string, data *genai.Part) (*artifact.SaveResponse, error)
+	List(context.Context) (*artifact.ListResponse, error)
+	Load(ctx context.Context, name string) (*artifact.LoadResponse, error)
+	LoadVersion(ctx context.Context, name string, version int) (*artifact.LoadResponse, error)
+}
+
+// Memory interface provides methods to access agent memory across the
+// sessions of the current user_id.
+type Memory interface {
+	AddSessionToMemory(context.Context, session.Session) error
+	SearchMemory(ctx context.Context, query string) (*memory.SearchResponse, error)
+}
+
+// BeforeAgentCallback is a function that is called before the agent starts
+// its run.
+// If it returns non-nil content or error, the agent run will be skipped and a
+// new event will be created.
+type BeforeAgentCallback func(Context) (*genai.Content, error)
+
+// AfterAgentCallback is a function that is called after the agent has completed
+// its run.
+// If it returns non-nil content or error, a new event will be created.
+//
+// The callback will be skipped also if EndInvocation was called before or
+// BeforeAgentCallbacks returned non-nil results.
+type AfterAgentCallback func(Context) (*genai.Content, error)
+
+type agent struct {
+	agentinternal.State
+
+	name, description string
+	subAgents         []Agent
+
+	beforeAgentCallbacks []BeforeAgentCallback
+	run                  func(InvocationContext) iter.Seq2[*session.Event, error]
+	afterAgentCallbacks  []AfterAgentCallback
+}
+
+func (a *agent) Name() string {
+	return a.name
+}
+
+func (a *agent) Description() string {
+	return a.description
+}
+
+func (a *agent) SubAgents() []Agent {
+	return a.subAgents
+}
+
+func (a *agent) Run(ctx InvocationContext) iter.Seq2[*session.Event, error] {
+	return func(yield func(*session.Event, error) bool) {
+		spanCtx, span := telemetry.StartNodeSpan(ctx, ctx, telemetry.OperationAgent{Agent: a})
+		yield, endSpan := telemetry.WrapYield(span, yield, func(span trace.Span, event *session.Event, err error) {
+			telemetry.TraceAgentResult(span, telemetry.TraceAgentResultParams{
+				ResponseEvent: event,
+				Error:         err,
+			})
+		})
+		defer endSpan()
+
+		var aa Agent = a
+		var newCtx context.Context = ctx.WithContext(spanCtx)
+
+		icDelta := &InvocationContextDelta{Agent: &aa, Context: &newCtx}
+
+		nodeCtx := PromoteWithDelta(ctx, &CommonContextDelta{
+			InvocationContextDelta: icDelta,
+		})
+
+		event, err := runBeforeAgentCallbacks(nodeCtx)
+		if event != nil || err != nil {
+			if !yield(event, err) {
+				return
+			}
+		}
+
+		if nodeCtx.Ended() {
+			return
+		}
+
+		for event, err := range a.run(nodeCtx) {
+			if event != nil && event.Author == "" {
+				event.Author = getAuthorForEvent(nodeCtx, event)
+			}
+			if !yield(event, err) {
+				return
+			}
+		}
+
+		if nodeCtx.Ended() {
+			return
+		}
+
+		event, err = runAfterAgentCallbacks(nodeCtx)
+		if event != nil || err != nil {
+			yield(event, err)
+		}
+	}
+}
+
+func (a *agent) internal() *agent {
+	return a
+}
+
+func (a *agent) FindAgent(name string) Agent {
+	if a.Name() == name {
+		return a
+	}
+	return a.FindSubAgent(name)
+}
+
+func (a *agent) FindSubAgent(name string) Agent {
+	for _, subAgent := range a.SubAgents() {
+		if result := subAgent.FindAgent(name); result != nil {
+			return result
+		}
+	}
+	return nil
+}
+
+func getAuthorForEvent(ctx Context, event *session.Event) string {
+	if event.LLMResponse.Content != nil && event.LLMResponse.Content.Role == genai.RoleUser {
+		return genai.RoleUser
+	}
+
+	return ctx.Agent().Name()
+}
+
+// eventActionsFrom returns the actions a callback accumulated, less the fields
+// that are the framework's to write rather than a callback's.
+//
+// A callback is handed the live [session.EventActions] so it can request state
+// deltas, escalation and transfers, and the struct is then copied wholesale onto
+// the persisted event. Anything on it that changes how later prompts are built
+// has to be filtered out here, or the callback gets to set it.
+func eventActionsFrom(actions *session.EventActions) session.EventActions {
+	out := *actions
+	out.Compaction = nil
+	return out
+}
+
+// runBeforeAgentCallbacks checks if any beforeAgentCallback returns non-nil content
+// then it skips agent run and returns callback result.
+func runBeforeAgentCallbacks(ctx InvocationContext) (*session.Event, error) {
+	agent := ctx.Agent()
+	pluginManager := pluginManagerFromContext(ctx)
+
+	actions := &session.EventActions{StateDelta: make(map[string]any), ArtifactDelta: make(map[string]int64)}
+	callbackCtx := NewCallbackContext(ctx, actions)
+
+	if pluginManager != nil {
+		content, err := pluginManager.RunBeforeAgentCallback(callbackCtx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to run plugin before agent callback: %w", err)
+		}
+		if content != nil {
+			event := session.NewEvent(ctx, ctx.InvocationID())
+			event.LLMResponse = model.LLMResponse{
+				Content: content,
+			}
+			event.Author = agent.Name()
+			event.Branch = ctx.Branch()
+			event.Actions = eventActionsFrom(actions)
+			ctx.EndInvocation()
+			return event, nil
+		}
+	}
+
+	for _, callback := range ctx.Agent().internal().beforeAgentCallbacks {
+		content, err := callback(callbackCtx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to run before agent callback: %w", err)
+		}
+		if content == nil {
+			continue
+		}
+
+		event := session.NewEvent(ctx, ctx.InvocationID())
+		event.LLMResponse = model.LLMResponse{
+			Content: content,
+		}
+		event.Author = agent.Name()
+		event.Branch = ctx.Branch()
+		event.Actions = eventActionsFrom(actions)
+		ctx.EndInvocation()
+		return event, nil
+	}
+
+	// check if has delta create event with it
+	if len(actions.StateDelta) > 0 {
+		event := session.NewEvent(ctx, ctx.InvocationID())
+		event.Author = agent.Name()
+		event.Branch = ctx.Branch()
+		event.Actions = eventActionsFrom(actions)
+		return event, nil
+	}
+
+	return nil, nil
+}
+
+// runAfterAgentCallbacks checks if any afterAgentCallback returns non-nil content or a state modification
+// then it create a new event with the new content and state delta.
+func runAfterAgentCallbacks(ctx InvocationContext) (*session.Event, error) {
+	agent := ctx.Agent()
+	pluginManager := pluginManagerFromContext(ctx)
+
+	actions := &session.EventActions{StateDelta: make(map[string]any), ArtifactDelta: make(map[string]int64)}
+	callbackCtx := NewCallbackContext(ctx, actions)
+
+	if pluginManager != nil {
+		content, err := pluginManager.RunAfterAgentCallback(callbackCtx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to run plugin after agent callback: %w", err)
+		}
+		if content != nil {
+			event := session.NewEvent(ctx, ctx.InvocationID())
+			event.LLMResponse = model.LLMResponse{
+				Content: content,
+			}
+			event.Author = agent.Name()
+			event.Branch = ctx.Branch()
+			event.Actions = eventActionsFrom(actions)
+			return event, nil
+		}
+	}
+
+	for _, callback := range agent.internal().afterAgentCallbacks {
+		newContent, err := callback(callbackCtx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to run after agent callback: %w", err)
+		}
+		if newContent == nil {
+			continue
+		}
+
+		event := session.NewEvent(ctx, ctx.InvocationID())
+		event.LLMResponse = model.LLMResponse{
+			Content: newContent,
+		}
+		event.Author = agent.Name()
+		event.Branch = ctx.Branch()
+		event.Actions = eventActionsFrom(actions)
+		// Deliberately not ending the invocation here, which matches the Python
+		// ADK. Ended reports whether the invocation should stop early, and nothing
+		// reads it after this point: running the after-agent callbacks is the last
+		// step of the agent's Run loop. The flag is also local to this agent's
+		// context and never propagates to a parent, so setting it here would imply
+		// an effect it does not have.
+		return event, nil
+	}
+
+	// check if has delta create event with it
+	if len(actions.StateDelta) > 0 {
+		event := session.NewEvent(ctx, ctx.InvocationID())
+		event.Author = agent.Name()
+		event.Branch = ctx.Branch()
+		event.Actions = eventActionsFrom(actions)
+		return event, nil
+	}
+	return nil, nil
+}
+
+type invocationContext struct {
+	context.Context
+	adkcontext.Marker
+
+	agent     Agent
+	artifacts Artifacts
+	memory    Memory
+	session   session.Session
+
+	invocationID   string
+	branch         string
+	isolationScope string
+	userContent    *genai.Content
+	runConfig      *RunConfig
+	endInvocation  bool
+}
+
+// Apply implements [InvocationContext].
+func (c *invocationContext) WithICDelta(d *InvocationContextDelta) InvocationContext {
+	if d == nil {
+		return c
+	}
+	res := *c
+	if d.UserContent != nil {
+		res.userContent = *d.UserContent
+	}
+	if d.Branch != nil {
+		res.branch = *d.Branch
+	}
+	if d.IsolationScope != nil {
+		res.isolationScope = *d.IsolationScope
+	}
+	if d.Agent != nil {
+		res.agent = *d.Agent
+	}
+	if d.Context != nil {
+		res.Context = *d.Context
+	}
+	return &res
+}
+
+func (c *invocationContext) Agent() Agent {
+	return c.agent
+}
+
+func (c *invocationContext) Artifacts() Artifacts {
+	return c.artifacts
+}
+
+func (c *invocationContext) Memory() Memory {
+	return c.memory
+}
+
+func (c *invocationContext) Session() session.Session {
+	return c.session
+}
+
+// Value implements context.Context, answering the ADK identity key like every
+// other invocation context so a promoted copy and this one cannot disagree. It
+// owns its session, so no session means no identity — never the enclosing
+// invocation's, whose user made no such call.
+func (c *invocationContext) Value(key any) any {
+	if c == nil {
+		return nil
+	}
+	if key == adkcontext.IdentityKey {
+		if id, ok := identityOf(func() session.Session { return c.session }); ok {
+			return id
+		}
+		return nil
+	}
+	if c.Context == nil {
+		return nil
+	}
+	return c.Context.Value(key)
+}
+
+func (c *invocationContext) InvocationID() string {
+	return c.invocationID
+}
+
+func (c *invocationContext) Branch() string {
+	return c.branch
+}
+
+func (c *invocationContext) IsolationScope() string {
+	return c.isolationScope
+}
+
+func (c *invocationContext) UserContent() *genai.Content {
+	return c.userContent
+}
+
+func (c *invocationContext) RunConfig() *RunConfig {
+	return c.runConfig
+}
+
+func (c *invocationContext) EndInvocation() {
+	c.endInvocation = true
+}
+
+func (c *invocationContext) Ended() bool {
+	return c.endInvocation
+}
+
+func (c *invocationContext) WithContext(ctx context.Context) InvocationContext {
+	newCtx := *c
+	newCtx.Context = ctx
+	return &newCtx
+}
+
+// ResumedInput always returns (nil, false) for the base
+// invocation context. Implementations that carry a resume payload
+// override this method.
+func (c *invocationContext) ResumedInput(string) (any, bool) { return nil, false }
+
+func pluginManagerFromContext(ctx context.Context) pluginManager {
+	a := ctx.Value(plugincontext.PluginManagerCtxKey)
+	m, ok := a.(pluginManager)
+	if !ok {
+		return nil
+	}
+	return m
+}
+
+type pluginManager interface {
+	RunBeforeAgentCallback(cctx Context) (*genai.Content, error)
+	RunAfterAgentCallback(cctx Context) (*genai.Content, error)
+}
+
+var _ InvocationContext = (*invocationContext)(nil)
